@@ -36,13 +36,17 @@
     <p>Required: Installed the
     <a href="https://sparks.gogo.co.nz/ch340.html">CH340 drivers</a></p>
     <p>Steps:</p>
-    <p>(1) Disconnect the module from you rack</p>
+    <p>(1) Disconnect the module from your rack</p>
     <p>(2) Connect the module to you computer via USB</p>
     <p>(3) Choose one of the options below</p>
-    <p>(4) After a succesfull update, it is recommended to reload the module into factory state (hold RESET during startup)</p>
+    <p>(4) After a succesfull update, reload the module into factory state (hold RESET during startup)</p>
     <br>
     <div class="row justify-content-center">
       <div class="col-12 col-md-4">
+        <button class="btn btn-success w-100 mb-3" arduino-uploader hex-href="./DIKTAAT_FW_1V1.hex" board="nano">
+          Install Firmware 1.1
+          <span class="upload-progress"></span>
+        </button>
         <button class="btn btn-success w-100 mb-3" arduino-uploader hex-href="./DIKTAAT_FW_1V0.hex" board="nano">
           Install Firmware 1.0
           <span class="upload-progress"></span>
