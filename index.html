@@ -2,11 +2,11 @@
 
 <html lang="en">
 <head>
-  
-  <meta http-equiv='cache-control' content='no-cache'> 
-  <meta http-equiv='expires' content='0'> 
+
+  <meta http-equiv='cache-control' content='no-cache'>
+  <meta http-equiv='expires' content='0'>
   <meta http-equiv='pragma' content='no-cache'>
-  
+
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
   <title>DIKTAAT Flasher</title>
@@ -22,6 +22,14 @@
       border-color: rgb(205, 148, 78) !important;
       color: #fff !important;
     }
+    .upload-status {
+      display: block;
+      margin-bottom: 0.75rem;
+      font-size: 0.9rem;
+      font-weight: 400;
+      opacity: 0.85;
+      min-height: 1.2em;
+    }
   </style>
 </head>
 <body class="bg-dark text-light">
@@ -33,8 +41,7 @@
     </div>
     <h1 class="text-center mb-5">DIKTAAT Web Flasher</h1>
     <p>Tested Web Browsers: Chrome (Recommended), Edge </p>
-    <p>Note: Some macOS/Linux users report a "timeout error" — while I try to figure it out, I recommend doing the update on a Windows PC or following <a href="DIKTAAT_update_guide.pdf" target="_blank">this guide</a>.</p>
-    <p class="mt-5">Steps:</p>
+    <p>Steps:</p>
     <p>(0) Install
     <a href="https://sparks.gogo.co.nz/ch340.html">CH340 drivers</a> (optional step, modern systems often have neccessary drivers preinstalled)</p>
     <p>(1) Disconnect the module from your rack</p>
@@ -44,19 +51,223 @@
     <br>
     <div class="row justify-content-center">
       <div class="col-12 col-md-4">
-        <button class="btn btn-success w-100 mb-3" arduino-uploader hex-href="./DIKTAAT_FW_1V1.hex" board="nano">
+        <p id="upload-status" class="upload-status text-center"></p>
+        <button class="btn btn-success w-100 mb-3" data-flash hex-href="./DIKTAAT_FW_1V1.hex">
           Install Firmware 1.1
-          <span class="upload-progress"></span>
         </button>
-        <button class="btn btn-success w-100 mb-3" arduino-uploader hex-href="./DIKTAAT_FW_1V0.hex" board="nano">
+        <button class="btn btn-success w-100 mb-3" data-flash hex-href="./DIKTAAT_FW_1V0.hex">
           Install Firmware 1.0
-          <span class="upload-progress"></span>
         </button>
       </div>
     </div>
   </div>
 
-  <script src="https://github.com/dbuezas/arduino-web-uploader/releases/download/v1.0.0/main.js"></script>
+  <!--
+    Self-contained flasher for the DIKTAAT (Arduino Nano / ATmega328P / Optiboot, via CH340).
+
+    This replaces the previous external arduino-web-uploader script. That uploader
+    timed out for macOS/Linux users because of two issues, both fixed below:
+
+      1. No explicit bootloader reset. It relied on the OS serial driver pulsing DTR
+         on port-open (Windows does, macOS/Linux CH340 does not), so the board never
+         entered its bootloader and STK500 sync timed out. Fixed by toggling DTR/RTS
+         explicitly (toggleReset) before syncing.
+
+      2. WebSerial reader leak. Using a fresh reader.read() per command raced against
+         a timeout left orphaned read() promises holding the stream lock and swallowing
+         the next reply, so only the first command ever worked. Fixed by running one
+         persistent reader loop that drains the port into a shared buffer (SerialIO).
+
+    Protocol: STK500v1, 115200 baud, 128-byte pages, word addressing.
+  -->
+  <script>
+  (() => {
+    "use strict";
+
+    // ---- STK500v1 constants ----
+    const SYNC_EOP = 0x20, INSYNC = 0x14, OK = 0x10;
+    const PAGE_SIZE = 128, BAUD = 115200, TIMEOUT = 1500;
+    const EXPECTED_SIG = [0x1e, 0x95, 0x0f]; // ATmega328P
+
+    // ---- Intel HEX -> flat flash image ----
+    function parseIntelHex(text) {
+      const lines = text.split(/\r?\n/).filter((l) => l.startsWith(":"));
+      let maxAddr = 0, base = 0;
+      const chunks = [];
+      for (const line of lines) {
+        const bytes = [];
+        for (let i = 1; i < line.length; i += 2) bytes.push(parseInt(line.substr(i, 2), 16));
+        const len = bytes[0], addr = (bytes[1] << 8) | bytes[2], type = bytes[3];
+        const data = bytes.slice(4, 4 + len);
+        const sum = bytes.slice(0, 4 + len).reduce((a, b) => (a + b) & 0xff, 0);
+        if (((sum + bytes[4 + len]) & 0xff) !== 0) throw new Error("HEX checksum error");
+        if (type === 0x00) { const abs = base + addr; chunks.push({ abs, data }); maxAddr = Math.max(maxAddr, abs + len); }
+        else if (type === 0x02) base = ((data[0] << 8) | data[1]) << 4;
+        else if (type === 0x04) base = ((data[0] << 8) | data[1]) << 16;
+        else if (type === 0x01) break;
+      }
+      const buf = new Uint8Array(maxAddr).fill(0xff);
+      for (const c of chunks) buf.set(c.data, c.abs);
+      return buf;
+    }
+
+    // ---- One persistent reader loop draining into a shared buffer ----
+    class SerialIO {
+      constructor(port) {
+        this.port = port;
+        this.writer = port.writable.getWriter();
+        this.reader = port.readable.getReader();
+        this.buf = [];
+        this.running = true;
+        this.loop = (async () => {
+          try {
+            while (this.running) {
+              const { value, done } = await this.reader.read();
+              if (done) break;
+              if (value && value.length) this.buf.push(...value);
+            }
+          } catch (_) { /* cancelled on close */ }
+        })();
+      }
+      async write(arr) { await this.writer.write(new Uint8Array(arr)); }
+      drain() { this.buf.length = 0; }
+      async waitFor(n, timeoutMs) {
+        const start = performance.now();
+        while (this.buf.length < n) {
+          if (performance.now() - start > timeoutMs) throw new Error("timeout: " + this.buf.length + "/" + n + " bytes");
+          await new Promise((r) => setTimeout(r, 5));
+        }
+        return this.buf.splice(0, n);
+      }
+      // send command + EOP, expect INSYNC ... OK; returns the `expectExtra` data bytes between them
+      async cmd(bytes, expectExtra = 0) {
+        this.drain();
+        await this.write([...bytes, SYNC_EOP]);
+        const resp = await this.waitFor(2 + expectExtra, TIMEOUT);
+        if (resp[0] !== INSYNC || resp[resp.length - 1] !== OK)
+          throw new Error("bad response: " + resp.map((b) => "0x" + b.toString(16)).join(" "));
+        return resp.slice(1, 1 + expectExtra);
+      }
+      async close() {
+        this.running = false;
+        try { await this.reader.cancel(); } catch (_) {}
+        try { this.reader.releaseLock(); } catch (_) {}
+        try { await this.loop; } catch (_) {}
+        try { this.writer.releaseLock(); } catch (_) {}
+      }
+    }
+
+    // ---- The fix: explicit hardware reset via DTR/RTS ----
+    async function toggleReset(port) {
+      await port.setSignals({ dataTerminalReady: false, requestToSend: false });
+      await new Promise((r) => setTimeout(r, 250));
+      await port.setSignals({ dataTerminalReady: true, requestToSend: true });
+    }
+
+    async function trySync(io) {
+      io.drain();
+      await io.write([0x30, SYNC_EOP]);
+      try {
+        const r = await io.waitFor(2, 400);
+        return r[0] === INSYNC && r[1] === OK;
+      } catch (_) { return false; }
+    }
+
+    async function flash(hexHref, setStatus) {
+      let port, io;
+      try {
+        setStatus("Loading firmware…");
+        const text = await fetch(hexHref).then((r) => {
+          if (!r.ok) throw new Error("cannot load firmware (" + r.status + ")");
+          return r.text();
+        });
+        const image = parseIntelHex(text);
+
+        setStatus("Select your module in the popup…");
+        port = await navigator.serial.requestPort();
+        await port.open({ baudRate: BAUD, bufferSize: 512 });
+        io = new SerialIO(port);
+
+        // reset into bootloader, then sync (with retries across a few reset rounds)
+        let synced = false;
+        for (let round = 0; round < 4 && !synced; round++) {
+          setStatus("Resetting board…");
+          await toggleReset(port);
+          await new Promise((r) => setTimeout(r, 60));
+          for (let i = 0; i < 6 && !synced; i++) {
+            synced = await trySync(io);
+            if (!synced) await new Promise((r) => setTimeout(r, 40));
+          }
+        }
+        if (!synced) throw new Error("could not reach the bootloader");
+
+        // verify signature
+        const sig = await io.cmd([0x75], 3);
+        if (!(sig[0] === EXPECTED_SIG[0] && sig[1] === EXPECTED_SIG[1] && sig[2] === EXPECTED_SIG[2]))
+          throw new Error("unexpected chip signature " + sig.map((b) => "0x" + b.toString(16)).join(" "));
+
+        await io.cmd([0x50]); // enter programming mode
+
+        const totalPages = Math.ceil(image.length / PAGE_SIZE);
+
+        // write
+        for (let p = 0; p < totalPages; p++) {
+          const off = p * PAGE_SIZE;
+          const slice = image.slice(off, Math.min(off + PAGE_SIZE, image.length));
+          const wordAddr = off >> 1;
+          await io.cmd([0x55, wordAddr & 0xff, (wordAddr >> 8) & 0xff]); // load address
+          await io.cmd([0x64, (slice.length >> 8) & 0xff, slice.length & 0xff, 0x46, ...slice]); // prog page
+          setStatus("Writing… " + Math.round(((p + 1) / totalPages) * 100) + "%");
+          await new Promise((r) => setTimeout(r, 4));
+        }
+
+        // verify (read back every page)
+        let mismatch = false;
+        for (let p = 0; p < totalPages && !mismatch; p++) {
+          const off = p * PAGE_SIZE;
+          const expected = image.slice(off, Math.min(off + PAGE_SIZE, image.length));
+          const wordAddr = off >> 1;
+          await io.cmd([0x55, wordAddr & 0xff, (wordAddr >> 8) & 0xff]); // load address
+          const readBack = await io.cmd([0x74, (expected.length >> 8) & 0xff, expected.length & 0xff, 0x46], expected.length);
+          for (let k = 0; k < expected.length; k++) if (readBack[k] !== expected[k]) { mismatch = true; break; }
+          setStatus("Verifying… " + Math.round(((p + 1) / totalPages) * 100) + "%");
+        }
+
+        await io.cmd([0x51]); // leave programming mode
+
+        if (mismatch) throw new Error("verification failed — please try again");
+        setStatus("✅ Done! Hold RESET during startup to load factory state.");
+      } catch (e) {
+        const msg = (e && e.name === "NotFoundError") ? "no module selected" : (e && e.message) || String(e);
+        setStatus("❌ " + msg);
+      } finally {
+        if (io) await io.close();
+        if (port) { try { await port.close(); } catch (_) {} }
+      }
+    }
+
+    // ---- wire up buttons ----
+    function init() {
+      const statusEl = document.getElementById("upload-status");
+      const setStatus = (m) => { if (statusEl) statusEl.textContent = m; };
+      if (!("serial" in navigator)) {
+        document.querySelectorAll("[data-flash]").forEach((btn) => (btn.disabled = true));
+        setStatus("This browser has no Web Serial — use Chrome or Edge on desktop.");
+        return;
+      }
+      const buttons = [...document.querySelectorAll("[data-flash]")];
+      buttons.forEach((btn) => {
+        btn.addEventListener("click", async () => {
+          buttons.forEach((b) => (b.disabled = true));
+          await flash(btn.getAttribute("hex-href"), setStatus);
+          buttons.forEach((b) => (b.disabled = false));
+        });
+      });
+    }
+
+    if (document.readyState === "loading") document.addEventListener("DOMContentLoaded", init);
+    else init();
+  })();
+  </script>
 </body>
 </html>
-
